@@ -68,6 +68,12 @@ func (t *openAIRawStreamTerminalState) Terminated() bool {
 	return t != nil && (t.sawDone || t.sawUsage || t.sawFinishReason)
 }
 
+// NeedsDoneSentinel reports a semantically complete compatible stream whose
+// upstream omitted the standard Chat Completions lifecycle sentinel.
+func (t *openAIRawStreamTerminalState) NeedsDoneSentinel() bool {
+	return t != nil && t.Terminated() && !t.sawDone
+}
+
 // IsTruncated 判定上游是否在任何终止信号之前结束。clientOutputStarted 用于放行
 // 非 SSE 响应体：那类响应本就没有 data: 行，既有行为是原样透传，不在本次判定范围内；
 // 但"一个字节都没收到"的空 200 依然算截断。

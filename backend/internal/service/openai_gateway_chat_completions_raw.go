@@ -158,6 +158,7 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletions(
 		}
 	}
 	upstreamBody = applyOllamaCloudRawChatCompletionsRequest(account, upstreamBody)
+	upstreamBody = applyDeepSeekRawChatCompletionsRequest(account, upstreamBody, originalModel, billingModel, upstreamModel)
 
 	logger.L().Debug("openai chat_completions raw: forwarding without protocol conversion",
 		zap.Int64("account_id", account.ID),
@@ -338,6 +339,7 @@ func (s *OpenAIGatewayService) streamRawChatCompletions(
 			}
 		}
 		line = applyOllamaCloudRawChatCompletionsSSELine(account, line)
+		line = applyDeepSeekRawChatCompletionsSSELine(account, line, originalModel, billingModel, upstreamModel)
 		line = stripEmptyChatToolCallIdentityFromSSELine(line)
 
 		writeLine(line)
@@ -433,6 +435,22 @@ func (s *OpenAIGatewayService) streamRawChatCompletions(
 		}
 	}
 
+	if !clientDisconnected && terminal.NeedsDoneSentinel() {
+		if !clientOutputStarted {
+			writeStreamHeaders()
+			clientOutputStarted = true
+		}
+		if _, werr := c.Writer.WriteString("\ndata: [DONE]\n\n"); werr != nil {
+			clientDisconnected = true
+			logger.L().Debug("openai chat_completions raw: client disconnected while writing synthesized done sentinel",
+				zap.Error(werr),
+				zap.String("request_id", requestID),
+			)
+		} else {
+			c.Writer.Flush()
+		}
+	}
+
 	return resultWithUsage(), nil
 }
 
@@ -509,6 +527,7 @@ func (s *OpenAIGatewayService) bufferRawChatCompletions(
 		return nil, newGrokMissingUsageFailoverError(c, account, upstreamRequestID)
 	}
 	respBody = applyOllamaCloudRawChatCompletionsResponse(account, respBody)
+	respBody = applyDeepSeekRawChatCompletionsResponse(account, respBody, originalModel, billingModel, upstreamModel)
 
 	if s.responseHeaderFilter != nil {
 		responseheaders.WriteFilteredHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)

@@ -69,6 +69,78 @@ func applyOllamaCloudRawChatCompletionsSSELine(account *Account, line string) st
 	return normalizeOllamaCloudChatCompletionsSSELine(line)
 }
 
+func isDeepSeekRawChatCompletionsRequest(account *Account, models ...string) bool {
+	if account != nil && account.Platform == PlatformDeepseek {
+		return true
+	}
+	for _, model := range models {
+		if strings.Contains(strings.ToLower(strings.TrimSpace(model)), "deepseek") {
+			return true
+		}
+	}
+	return false
+}
+
+func applyDeepSeekRawChatCompletionsRequest(account *Account, body []byte, models ...string) []byte {
+	if len(body) == 0 || !isDeepSeekRawChatCompletionsRequest(account, models...) {
+		return body
+	}
+	return normalizeDeepSeekChatCompletionsRequest(body)
+}
+
+func applyDeepSeekRawChatCompletionsResponse(account *Account, body []byte, models ...string) []byte {
+	if len(body) == 0 || !isDeepSeekRawChatCompletionsRequest(account, models...) {
+		return body
+	}
+	return normalizeOllamaCloudChatCompletionsResponseJSON(body)
+}
+
+func applyDeepSeekRawChatCompletionsSSELine(account *Account, line string, models ...string) string {
+	if line == "" || !isDeepSeekRawChatCompletionsRequest(account, models...) {
+		return line
+	}
+	return normalizeOllamaCloudChatCompletionsSSELine(line)
+}
+
+// normalizeDeepSeekChatCompletionsRequest keeps tool-call continuation turns
+// compatible with clients that replay reasoning under reasoning/thinking.
+func normalizeDeepSeekChatCompletionsRequest(body []byte) []byte {
+	if !gjson.ValidBytes(body) {
+		return body
+	}
+	messages := gjson.GetBytes(body, "messages")
+	if !messages.IsArray() {
+		return body
+	}
+	updated := body
+	changed := false
+	for i, msg := range messages.Array() {
+		if msg.Get("role").String() != "assistant" {
+			continue
+		}
+		if _, ok := jsonNonEmptyString(msg.Get("reasoning_content")); ok {
+			continue
+		}
+		src, ok := jsonNonEmptyString(msg.Get("reasoning"))
+		if !ok {
+			src, ok = jsonNonEmptyString(msg.Get("thinking"))
+		}
+		if !ok {
+			continue
+		}
+		next, err := sjson.SetBytes(updated, "messages."+strconv.Itoa(i)+".reasoning_content", src)
+		if err != nil {
+			return body
+		}
+		updated = next
+		changed = true
+	}
+	if !changed {
+		return body
+	}
+	return updated
+}
+
 func normalizeOllamaCloudChatCompletionsRequest(body []byte) []byte {
 	if !gjson.ValidBytes(body) {
 		return body

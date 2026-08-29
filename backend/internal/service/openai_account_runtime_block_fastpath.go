@@ -462,15 +462,19 @@ func (s *OpenAIGatewayService) clearOpenAIAccountModelTransientState(accountID i
 }
 
 func (s *OpenAIGatewayService) isOpenAIAccountModelRuntimeBlocked(account *Account, requestedModel string) bool {
+	return s.openAIAccountModelRuntimeBlockRemaining(account, requestedModel) > 0
+}
+
+func (s *OpenAIGatewayService) openAIAccountModelRuntimeBlockRemaining(account *Account, requestedModel string) time.Duration {
 	if s == nil || account == nil {
-		return false
+		return 0
 	}
 	state := s.getOpenAIAccountModelTransientState()
 	if state == nil {
-		return false
+		return 0
 	}
 	canonicalModel := canonicalOpenAIAccountSchedulingModel(account, requestedModel)
-	return state.isBlocked(account.ID, openAIAccountModelTransientModel(canonicalModel), time.Now())
+	return state.blockRemaining(account.ID, openAIAccountModelTransientModel(canonicalModel), time.Now())
 }
 
 func (s *OpenAIGatewayService) isOpenAIAccountRequestRuntimeBlocked(account *Account, requestedModel string) bool {

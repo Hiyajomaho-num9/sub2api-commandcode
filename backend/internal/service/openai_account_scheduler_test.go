@@ -2802,6 +2802,79 @@ func TestOpenAIAccountScheduler_SkipsAccountBlockedForRequestedModel(t *testing.
 	require.True(t, scheduler.isAccountRequestCompatible(context.Background(), account, OpenAIAccountScheduleRequest{RequestedModel: "gpt-5.6-sol"}))
 }
 
+func TestOpenAIGatewayService_SelectAccountWithScheduler_WaitsForModelTransientCooldown(t *testing.T) {
+	groupID := int64(10124)
+	account := Account{
+		ID:          21634,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeAPIKey,
+		Status:      StatusActive,
+		Schedulable: true,
+		Concurrency: 1,
+		GroupIDs:    []int64{groupID},
+	}
+	svc := &OpenAIGatewayService{
+		accountRepo:          schedulerTestOpenAIAccountRepo{accounts: []Account{account}},
+		cache:                &schedulerTestGatewayCache{},
+		cfg:                  newSchedulerTestSubscriptionPriorityConfig(),
+		rateLimitService:     newOpenAIAdvancedSchedulerRateLimitService("true"),
+		concurrencyService:   NewConcurrencyService(schedulerTestConcurrencyCache{}),
+		openaiModelTransient: newOpenAIAccountModelTransientState(128),
+	}
+	blockStarted := time.Now().Add(-openAIModelTransientShortCooldown + 80*time.Millisecond)
+	svc.openaiModelTransient.recordFailure(account.ID, "gpt-5.5", blockStarted.Add(-time.Millisecond))
+	svc.openaiModelTransient.recordFailure(account.ID, "gpt-5.5", blockStarted)
+
+	started := time.Now()
+	selection, _, err := svc.SelectAccountWithScheduler(context.Background(), &groupID, "", "session_transient_wait", "gpt-5.5", nil, OpenAIUpstreamTransportAny, false)
+
+	require.NoError(t, err)
+	require.NotNil(t, selection)
+	require.NotNil(t, selection.Account)
+	require.Equal(t, account.ID, selection.Account.ID)
+	require.GreaterOrEqual(t, time.Since(started), 60*time.Millisecond)
+	if selection.ReleaseFunc != nil {
+		selection.ReleaseFunc()
+	}
+}
+
+func TestOpenAIGatewayService_SelectAccountWithScheduler_ModelTransientWaitHonorsCancellation(t *testing.T) {
+	groupID := int64(10125)
+	account := Account{
+		ID:          21635,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeAPIKey,
+		Status:      StatusActive,
+		Schedulable: true,
+		Concurrency: 1,
+		GroupIDs:    []int64{groupID},
+	}
+	svc := &OpenAIGatewayService{
+		accountRepo:          schedulerTestOpenAIAccountRepo{accounts: []Account{account}},
+		cache:                &schedulerTestGatewayCache{},
+		cfg:                  newSchedulerTestSubscriptionPriorityConfig(),
+		rateLimitService:     newOpenAIAdvancedSchedulerRateLimitService("true"),
+		concurrencyService:   NewConcurrencyService(schedulerTestConcurrencyCache{}),
+		openaiModelTransient: newOpenAIAccountModelTransientState(128),
+	}
+	now := time.Now()
+	svc.openaiModelTransient.recordFailure(account.ID, "gpt-5.5", now.Add(-time.Millisecond))
+	svc.openaiModelTransient.recordFailure(account.ID, "gpt-5.5", now)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+
+	started := time.Now()
+	selection, _, err := svc.SelectAccountWithScheduler(ctx, &groupID, "", "session_transient_cancel", "gpt-5.5", nil, OpenAIUpstreamTransportAny, false)
+
+	require.ErrorIs(t, err, context.Canceled)
+	require.Nil(t, selection)
+	require.Less(t, time.Since(started), time.Second)
+}
+
 func TestReportOpenAIAccountScheduleResult_SuccessClearsModelTransientState(t *testing.T) {
 	svc := &OpenAIGatewayService{openaiModelTransient: newOpenAIAccountModelTransientState(128)}
 	now := time.Now()

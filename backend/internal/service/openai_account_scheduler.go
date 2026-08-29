@@ -1351,6 +1351,50 @@ type openAISelectionFilterStats struct {
 	reasons map[string]int
 }
 
+type openAIModelTransientSelectionError struct {
+	cause      error
+	retryAfter time.Duration
+}
+
+func (e *openAIModelTransientSelectionError) Error() string {
+	if e == nil || e.cause == nil {
+		return ErrNoAvailableAccounts.Error()
+	}
+	return e.cause.Error()
+}
+
+func (e *openAIModelTransientSelectionError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+func withOpenAIModelTransientSelectionWait(err error, retryAfter time.Duration) error {
+	if err == nil || retryAfter <= 0 {
+		return err
+	}
+	return &openAIModelTransientSelectionError{cause: err, retryAfter: retryAfter}
+}
+
+func openAIModelTransientSelectionRetryAfter(err error) (time.Duration, bool) {
+	var transientErr *openAIModelTransientSelectionError
+	if !errors.As(err, &transientErr) || transientErr.retryAfter <= 0 {
+		return 0, false
+	}
+	return transientErr.retryAfter, true
+}
+
+func minPositiveDuration(current, candidate time.Duration) time.Duration {
+	if candidate <= 0 {
+		return current
+	}
+	if current <= 0 || candidate < current {
+		return candidate
+	}
+	return current
+}
+
 func (s *openAISelectionFilterStats) exclude(reason string) {
 	if s.reasons == nil {
 		s.reasons = make(map[string]int, 4)
@@ -1431,6 +1475,7 @@ func (s *defaultOpenAIAccountScheduler) selectByLoadBalance(
 	filterStats := openAISelectionFilterStats{pool: len(accounts)}
 	filtered := make([]*Account, 0, len(accounts))
 	loadReq := make([]AccountWithConcurrency, 0, len(accounts))
+	var modelTransientRetryAfter time.Duration
 	for i := range accounts {
 		account := &accounts[i]
 		if req.ExcludedIDs != nil {
@@ -1449,6 +1494,8 @@ func (s *defaultOpenAIAccountScheduler) selectByLoadBalance(
 		}
 		if s.service.isOpenAIAccountRequestRuntimeBlocked(account, req.RequestedModel) {
 			filterStats.exclude("runtime_blocked")
+			modelTransientRetryAfter = minPositiveDuration(modelTransientRetryAfter,
+				s.service.openAIAccountModelRuntimeBlockRemaining(account, req.RequestedModel))
 			continue
 		}
 		// require_privacy_set is a group-scoped eligibility gate. Do not mutate the
@@ -1473,7 +1520,8 @@ func (s *defaultOpenAIAccountScheduler) selectByLoadBalance(
 		})
 	}
 	if len(filtered) == 0 {
-		return nil, 0, 0, 0, noAvailableOpenAISelectionError(req.RequestedModel, false, filterStats.summary(""))
+		err := noAvailableOpenAISelectionError(req.RequestedModel, false, filterStats.summary(""))
+		return nil, 0, 0, 0, withOpenAIModelTransientSelectionWait(err, modelTransientRetryAfter)
 	}
 
 	loadMap := map[int64]*AccountLoadInfo{}
@@ -2160,6 +2208,21 @@ func (s *OpenAIGatewayService) selectAccountWithScheduler(
 	useUpstreamTokenCost bool,
 ) (*AccountSelectionResult, OpenAIAccountScheduleDecision, error) {
 	selection, decision, err := s.selectAccountWithSchedulerOnce(ctx, groupID, previousResponseID, sessionHash, requestedModel, excludedIDs, requiredTransport, requiredCapability, requiredImageCapability, requireCompact, platform, previousResponseCanMove, useUpstreamTokenCost)
+	if retryAfter, ok := openAIModelTransientSelectionRetryAfter(err); ok {
+		waitFor := retryAfter + 10*time.Millisecond
+		slog.Debug("openai scheduler: waiting for model transient cooldown",
+			"model", requestedModel,
+			"wait_for", waitFor,
+		)
+		timer := time.NewTimer(waitFor)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return selection, decision, ctx.Err()
+		case <-timer.C:
+		}
+		selection, decision, err = s.selectAccountWithSchedulerOnce(ctx, groupID, previousResponseID, sessionHash, requestedModel, excludedIDs, requiredTransport, requiredCapability, requiredImageCapability, requireCompact, platform, previousResponseCanMove, useUpstreamTokenCost)
+	}
 	if err == nil || openAIProxyStreamQuarantineBypassed(ctx) {
 		return selection, decision, err
 	}
