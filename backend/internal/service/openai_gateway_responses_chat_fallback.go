@@ -83,6 +83,16 @@ func (s *OpenAIGatewayService) forwardResponsesViaRawChatCompletions(
 	reasoningEffort := extractOpenAIReasoningEffortFromBody(body, upstreamModel, billingModel, originalModel)
 	// 国产模型默认 effort 补充：需要 mappedModel 判定，推迟到 billingModel 算出之后。
 	reasoningEffort = ApplyThinkingEnabledFallback(reasoningEffort, body, billingModel)
+	if agentHarnessMode {
+		// Codex/DSH may dynamically downgrade a simple tool turn to low even when
+		// the selected DeepSeek agent profile is Max. This compatibility route is
+		// explicitly the Max agent lane: keep every turn, including short tool
+		// continuations, on the same reasoning level and report the effective level
+		// used for billing/observability.
+		chatReq.ReasoningEffort = "max"
+		effectiveReasoningEffort := "max"
+		reasoningEffort = &effectiveReasoningEffort
+	}
 	chatReq.Model = upstreamModel
 	if clientStream {
 		chatReq.StreamOptions = &apicompat.ChatStreamOptions{IncludeUsage: true}

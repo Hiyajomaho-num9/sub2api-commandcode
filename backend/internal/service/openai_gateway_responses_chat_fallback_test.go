@@ -188,6 +188,7 @@ func TestForwardResponses_DeepSeekAgentHarnessCompactsReasoningAndCachesFullText
 		"instructions":"Keep the repository clean.",
 		"input":"inspect the workspace",
 		"tools":[{"type":"function","name":"exec_command","description":"Run a command","parameters":{"type":"object","properties":{"cmd":{"type":"string"}},"required":["cmd"]}}],
+		"reasoning":{"effort":"low"},
 		"stream":true
 	}`)
 	rec := httptest.NewRecorder()
@@ -228,6 +229,9 @@ func TestForwardResponses_DeepSeekAgentHarnessCompactsReasoningAndCachesFullText
 	require.Contains(t, systemPrompt, "end this turn immediately")
 	require.Equal(t, "user", gjson.GetBytes(upstream.lastBody, "messages.1.role").String())
 	require.Equal(t, "exec_command", gjson.GetBytes(upstream.lastBody, "tools.0.function.name").String())
+	require.Equal(t, "max", gjson.GetBytes(upstream.lastBody, "reasoning_effort").String())
+	require.NotNil(t, result.ReasoningEffort)
+	require.Equal(t, "max", *result.ReasoningEffort)
 
 	clientBody := rec.Body.String()
 	require.Contains(t, clientBody, "Selected the next tool action.")
