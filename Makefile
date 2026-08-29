@@ -1,5 +1,7 @@
 .PHONY: build build-backend build-frontend test test-backend test-frontend test-frontend-critical
 
+PNPM ?= corepack pnpm@9.15.9
+
 FRONTEND_CRITICAL_VITEST := \
 	src/api/__tests__/client.spec.ts \
 	src/api/__tests__/tokenRefresh.spec.ts \
@@ -15,8 +17,9 @@ FRONTEND_CRITICAL_VITEST := \
 	src/features/channel-monitor-v2/__tests__/monitorFormat.spec.ts \
 	src/features/channel-monitor-v2/__tests__/monitorZoom.spec.ts
 
-# 一键编译前后端
-build: build-backend build-frontend
+# 一键编译可直接部署的前后端嵌入版
+build: build-frontend
+	@$(MAKE) -C backend build BUILD_TAGS=embed
 
 # 编译后端（复用 backend/Makefile）
 build-backend:
@@ -24,7 +27,7 @@ build-backend:
 
 # 编译前端（需要已安装依赖）
 build-frontend:
-	@pnpm --dir frontend run build
+	@$(PNPM) --dir frontend run build
 
 # 运行测试（后端 + 前端）
 test: test-backend test-frontend
@@ -33,9 +36,9 @@ test-backend:
 	@$(MAKE) -C backend test
 
 test-frontend:
-	@pnpm --dir frontend run lint:check
-	@pnpm --dir frontend run typecheck
+	@$(PNPM) --dir frontend run lint:check
+	@$(PNPM) --dir frontend run typecheck
 	@$(MAKE) test-frontend-critical
 
 test-frontend-critical:
-	@pnpm --dir frontend exec vitest run $(FRONTEND_CRITICAL_VITEST)
+	@$(PNPM) --dir frontend exec vitest run $(FRONTEND_CRITICAL_VITEST)

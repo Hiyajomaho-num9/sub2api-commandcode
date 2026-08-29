@@ -2,9 +2,11 @@
 
 VERSION ?= $(shell ./scripts/resolve-version.sh)
 LDFLAGS ?= -s -w -X main.Version=$(VERSION)
+BUILD_TAGS ?=
+BUILD_TAGS_ARG := $(if $(strip $(BUILD_TAGS)),-tags "$(BUILD_TAGS)")
 
 build:
-	CGO_ENABLED=0 go build -ldflags="$(LDFLAGS)" -trimpath -o bin/server ./cmd/server
+	CGO_ENABLED=0 go build $(BUILD_TAGS_ARG) -ldflags="$(LDFLAGS)" -trimpath -o bin/server ./cmd/server
 
 generate:
 	go generate ./ent
