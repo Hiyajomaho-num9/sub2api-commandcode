@@ -145,6 +145,53 @@ func TestStream_ReasoningThenToolCallDoesNotSynthesizeVisibleText(t *testing.T) 
 	}
 }
 
+func TestStream_CompactReasoningSummaryKeepsRawReasoningPrivate(t *testing.T) {
+	state := NewChatCompletionsToResponsesStreamState("deepseek-v4-flash")
+	state.CompactReasoningSummary = true
+
+	reasoningChunks := []string{
+		`{"choices":[{"index":0,"delta":{"reasoning_content":"private step one. "}}]}`,
+		`{"choices":[{"index":0,"delta":{"reasoning_content":"private step two."}}]}`,
+	}
+	var events []ResponsesStreamEvent
+	for _, payload := range reasoningChunks {
+		var chunk ChatCompletionsChunk
+		require.NoError(t, json.Unmarshal([]byte(payload), &chunk))
+		events = append(events, ChatCompletionsChunkToResponsesEvents(&chunk, state)...)
+	}
+	for _, event := range events {
+		require.NotEqual(t, "response.reasoning_summary_text.delta", event.Type,
+			"raw reasoning chunks must not be streamed as public summary text")
+	}
+
+	var toolChunk ChatCompletionsChunk
+	require.NoError(t, json.Unmarshal([]byte(
+		`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"exec","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`,
+	), &toolChunk))
+	events = append(events, ChatCompletionsChunkToResponsesEvents(&toolChunk, state)...)
+	events = append(events, FinalizeChatCompletionsResponsesStream(state)...)
+
+	var reasoningItemID string
+	for _, event := range events {
+		require.NotContains(t, event.Delta, "private step")
+		require.NotContains(t, event.Text, "private step")
+		if event.Type == "response.reasoning_summary_text.delta" {
+			require.Equal(t, "Selected the next tool action.", event.Delta)
+		}
+		if event.Type == "response.output_item.done" && event.Item != nil && event.Item.Type == "reasoning" {
+			reasoningItemID = event.Item.ID
+			require.Equal(t, "Selected the next tool action.", event.Item.Summary[0].Text)
+		}
+		if event.Type == "response.completed" {
+			require.NotNil(t, event.Response)
+			require.Equal(t, reasoningItemID, event.Response.Output[0].ID)
+			require.Equal(t, "Selected the next tool action.", event.Response.Output[0].Summary[0].Text)
+		}
+	}
+	require.Equal(t, "private step one. private step two.", state.Reasoning.String())
+	require.NotEmpty(t, reasoningItemID)
+}
+
 // TestStream_ToolCallLifecycleComplete guards that a tool call is fully closed
 // (function_call_arguments.done + output_item.done with full arguments), which
 // codex needs to execute the call.

@@ -31,6 +31,21 @@ type ResponsesToChatOptions struct {
 	// longer provide. Return "" on a miss. A nil lookup keeps the original
 	// behavior.
 	ReasoningContentByID func(itemID string) string
+
+	// PreferReasoningContentByID makes the cache authoritative when both a
+	// plaintext summary and cached reasoning exist. Agent bridges can expose a
+	// short public summary while retaining the provider's full reasoning in the
+	// gateway cache for DeepSeek's required history passback.
+	PreferReasoningContentByID bool
+}
+
+// ChatCompletionsToResponsesOptions controls optional response-side bridge
+// behavior. Nil options preserve the legacy conversion exactly.
+type ChatCompletionsToResponsesOptions struct {
+	// CompactReasoningSummary keeps provider chain-of-thought out of the public
+	// Responses summary. The full text remains in stream state so the gateway can
+	// cache and pass it back on later DeepSeek tool turns.
+	CompactReasoningSummary bool
 }
 
 // ResponsesToChatCompletionsRequest converts a Responses API request into a
@@ -363,17 +378,30 @@ func buildChatMessagesFromItems(messages []ChatMessage, rawItems []json.RawMessa
 		itemType := rawString(item["type"])
 		switch itemType {
 		case "reasoning":
-			if txt := extractResponsesReasoningText(item); txt != "" {
-				pendingReasoning = txt
-			} else if opts != nil && opts.ReasoningContentByID != nil {
+			lookupCached := func() string {
+				if opts == nil || opts.ReasoningContentByID == nil {
+					return ""
+				}
+				if id := rawString(item["id"]); id != "" {
+					return opts.ReasoningContentByID(id)
+				}
+				return ""
+			}
+			resolvedReasoning := ""
+			if opts != nil && opts.PreferReasoningContentByID {
+				resolvedReasoning = lookupCached()
+			}
+			if resolvedReasoning == "" {
+				resolvedReasoning = extractResponsesReasoningText(item)
+			}
+			if resolvedReasoning == "" && opts != nil && opts.ReasoningContentByID != nil {
 				// No plaintext summary (encrypted-only reasoning, e.g. after codex
 				// remote compaction): fall back to the gateway-side cache keyed
 				// by the reasoning item id, which always round-trips in history.
-				if id := rawString(item["id"]); id != "" {
-					if cached := opts.ReasoningContentByID(id); cached != "" {
-						pendingReasoning = cached
-					}
-				}
+				resolvedReasoning = lookupCached()
+			}
+			if resolvedReasoning != "" {
+				pendingReasoning = resolvedReasoning
 			}
 			if pendingReasoning != "" {
 				lastTurnReasoning = pendingReasoning
@@ -1203,6 +1231,12 @@ func extractCustomToolCallInput(arguments string) string {
 // 的调用会还原为 tool_search_call 项；namespaceTools 是 namespace 子工具的摊平名
 // 映射（见 NamespaceToolNames），命中的调用还原为带 namespace 字段的 function_call 项。
 func ChatCompletionsResponseToResponses(resp *ChatCompletionsResponse, model string, customTools, functionTools map[string]bool, toolSearch bool, namespaceTools map[string]NamespacedToolName) *ResponsesResponse {
+	return ChatCompletionsResponseToResponsesWithOptions(resp, model, customTools, functionTools, toolSearch, namespaceTools, nil)
+}
+
+// ChatCompletionsResponseToResponsesWithOptions is
+// ChatCompletionsResponseToResponses with optional response-side controls.
+func ChatCompletionsResponseToResponsesWithOptions(resp *ChatCompletionsResponse, model string, customTools, functionTools map[string]bool, toolSearch bool, namespaceTools map[string]NamespacedToolName, opts *ChatCompletionsToResponsesOptions) *ResponsesResponse {
 	id := ""
 	if resp != nil {
 		id = resp.ID
@@ -1239,7 +1273,7 @@ func ChatCompletionsResponseToResponses(resp *ChatCompletionsResponse, model str
 
 	if len(resp.Choices) > 0 {
 		choice := resp.Choices[0]
-		out.Output = chatMessageToResponsesOutput(choice.Message, customTools, functionTools, toolSearch, namespaceTools)
+		out.Output = chatMessageToResponsesOutput(choice.Message, customTools, functionTools, toolSearch, namespaceTools, opts)
 		if choice.FinishReason == "length" {
 			out.Status = "incomplete"
 			out.IncompleteDetails = &ResponsesIncompleteDetails{Reason: "max_output_tokens"}
@@ -1261,22 +1295,27 @@ func chatServiceTier(resp *ChatCompletionsResponse) string {
 	return resp.ServiceTier
 }
 
-func chatMessageToResponsesOutput(message ChatMessage, customTools, functionTools map[string]bool, toolSearch bool, namespaceTools map[string]NamespacedToolName) []ResponsesOutput {
+func chatMessageToResponsesOutput(message ChatMessage, customTools, functionTools map[string]bool, toolSearch bool, namespaceTools map[string]NamespacedToolName, opts *ChatCompletionsToResponsesOptions) []ResponsesOutput {
 	var outputs []ResponsesOutput
 	reasoning := message.reasoningText()
 	if reasoning != "" {
+		summary := reasoning
+		if opts != nil && opts.CompactReasoningSummary {
+			summary = compactChatReasoningSummary(len(message.ToolCalls) > 0, chatMessageContentText(message.Content) != "")
+		}
 		outputs = append(outputs, ResponsesOutput{
 			Type: "reasoning",
 			ID:   generateItemID(),
 			Summary: []ResponsesSummary{{
 				Type: "summary_text",
-				Text: reasoning,
+				Text: summary,
 			}},
 		})
 	}
 
 	text := chatMessageContentText(message.Content)
-	if text == "" && strings.TrimSpace(reasoning) != "" && len(message.ToolCalls) == 0 {
+	if text == "" && strings.TrimSpace(reasoning) != "" && len(message.ToolCalls) == 0 &&
+		(opts == nil || !opts.CompactReasoningSummary) {
 		text = reasoning
 	}
 	if text != "" || len(message.ToolCalls) == 0 {
@@ -1451,6 +1490,11 @@ type ChatCompletionsToResponsesStreamState struct {
 	ReasoningIndex  int
 	ReasoningOpen   bool
 	ReasoningDone   bool
+	// CompactReasoningSummary buffers upstream reasoning privately and emits one
+	// bounded status summary when reasoning closes. It is enabled only by callers
+	// adapting a Chat model to an agent-oriented Responses client.
+	CompactReasoningSummary bool
+	ReasoningSummaryText    string
 
 	// Message item + output_text content-part lifecycle.
 	MessageItemID string
@@ -1582,18 +1626,21 @@ func ChatCompletionsChunkToResponsesEvents(
 		// empty-string reasoning delta upstreams send is filtered out.
 		reasoning := choice.Delta.reasoningText()
 		if reasoning != nil && *reasoning != "" {
-			events = append(events, ensureChatReasoningItem(state)...)
 			_, _ = state.Reasoning.WriteString(*reasoning)
-			events = append(events, chatToResponsesEvent(state, "response.reasoning_summary_text.delta", &ResponsesStreamEvent{
-				OutputIndex:  state.ReasoningIndex,
-				SummaryIndex: 0,
-				Delta:        *reasoning,
-				ItemID:       state.ReasoningItemID,
-			}))
+			if !state.CompactReasoningSummary {
+				events = append(events, ensureChatReasoningItem(state)...)
+				events = append(events, chatToResponsesEvent(state, "response.reasoning_summary_text.delta", &ResponsesStreamEvent{
+					OutputIndex:  state.ReasoningIndex,
+					SummaryIndex: 0,
+					Delta:        *reasoning,
+					ItemID:       state.ReasoningItemID,
+				}))
+			}
 		}
 		if choice.Delta.Content != nil && *choice.Delta.Content != "" {
 			// First real content closes the reasoning item, then opens the
 			// message item and its output_text content part.
+			state.ReasoningSummaryText = compactChatReasoningSummary(false, true)
 			events = append(events, closeChatReasoningItem(state)...)
 			events = append(events, ensureChatToResponsesMessageItem(state)...)
 			events = append(events, ensureChatToResponsesTextPart(state)...)
@@ -1613,6 +1660,7 @@ func ChatCompletionsChunkToResponsesEvents(
 			stored, ok := state.ToolCalls[idx]
 			if !ok {
 				// A tool call closes any open reasoning item first.
+				state.ReasoningSummaryText = compactChatReasoningSummary(true, false)
 				events = append(events, closeChatReasoningItem(state)...)
 				copyCall := toolCall
 				if copyCall.ID == "" {
@@ -1779,24 +1827,41 @@ func ensureChatReasoningItem(state *ChatCompletionsToResponsesStreamState) []Res
 // closeChatReasoningItem emits the reasoning item's terminal events
 // (reasoning_summary_text.done + reasoning_summary_part.done + output_item.done).
 func closeChatReasoningItem(state *ChatCompletionsToResponsesStreamState) []ResponsesStreamEvent {
-	if !state.ReasoningOpen {
+	if state == nil || state.ReasoningDone || state.Reasoning.Len() == 0 {
 		return nil
+	}
+	var events []ResponsesStreamEvent
+	if !state.ReasoningOpen {
+		events = append(events, ensureChatReasoningItem(state)...)
 	}
 	state.ReasoningOpen = false
 	state.ReasoningDone = true
 	reasoning := state.Reasoning.String()
-	return []ResponsesStreamEvent{
+	summary := reasoning
+	if state.CompactReasoningSummary {
+		summary = state.ReasoningSummaryText
+		if summary == "" {
+			summary = compactChatReasoningSummary(false, false)
+		}
+		events = append(events, chatToResponsesEvent(state, "response.reasoning_summary_text.delta", &ResponsesStreamEvent{
+			OutputIndex:  state.ReasoningIndex,
+			SummaryIndex: 0,
+			Delta:        summary,
+			ItemID:       state.ReasoningItemID,
+		}))
+	}
+	events = append(events, []ResponsesStreamEvent{
 		chatToResponsesEvent(state, "response.reasoning_summary_text.done", &ResponsesStreamEvent{
 			OutputIndex:  state.ReasoningIndex,
 			SummaryIndex: 0,
-			Text:         reasoning,
+			Text:         summary,
 			ItemID:       state.ReasoningItemID,
 		}),
 		chatToResponsesEvent(state, "response.reasoning_summary_part.done", &ResponsesStreamEvent{
 			OutputIndex:  state.ReasoningIndex,
 			SummaryIndex: 0,
 			ItemID:       state.ReasoningItemID,
-			Part:         &ResponsesContentPart{Type: "summary_text", Text: reasoning},
+			Part:         &ResponsesContentPart{Type: "summary_text", Text: summary},
 		}),
 		chatToResponsesEvent(state, "response.output_item.done", &ResponsesStreamEvent{
 			OutputIndex: state.ReasoningIndex,
@@ -1804,14 +1869,16 @@ func closeChatReasoningItem(state *ChatCompletionsToResponsesStreamState) []Resp
 				Type:    "reasoning",
 				ID:      state.ReasoningItemID,
 				Status:  "completed",
-				Summary: []ResponsesSummary{{Type: "summary_text", Text: reasoning}},
+				Summary: []ResponsesSummary{{Type: "summary_text", Text: summary}},
 			},
 		}),
-	}
+	}...)
+	return events
 }
 
 func synthesizeChatReasoningFallbackMessage(state *ChatCompletionsToResponsesStreamState) []ResponsesStreamEvent {
 	if state == nil ||
+		state.CompactReasoningSummary ||
 		state.MessageItemID != "" ||
 		state.Text.Len() > 0 ||
 		state.Reasoning.Len() == 0 ||
@@ -2035,12 +2102,19 @@ func closeChatToolItems(state *ChatCompletionsToResponsesStreamState) []Response
 func (state *ChatCompletionsToResponsesStreamState) chatOutput() []ResponsesOutput {
 	var outputs []ResponsesOutput
 	if state.Reasoning.Len() > 0 {
+		summary := state.Reasoning.String()
+		if state.CompactReasoningSummary {
+			summary = state.ReasoningSummaryText
+			if summary == "" {
+				summary = compactChatReasoningSummary(len(state.ToolCalls) > 0, state.Text.Len() > 0)
+			}
+		}
 		outputs = append(outputs, ResponsesOutput{
 			Type: "reasoning",
-			ID:   generateItemID(),
+			ID:   nonEmpty(state.ReasoningItemID, generateItemID()),
 			Summary: []ResponsesSummary{{
 				Type: "summary_text",
-				Text: state.Reasoning.String(),
+				Text: summary,
 			}},
 		})
 	}
@@ -2101,6 +2175,17 @@ func (state *ChatCompletionsToResponsesStreamState) chatOutput() []ResponsesOutp
 		})
 	}
 	return outputs
+}
+
+func compactChatReasoningSummary(hasToolCall, hasText bool) string {
+	switch {
+	case hasToolCall:
+		return "Selected the next tool action."
+	case hasText:
+		return "Prepared the response."
+	default:
+		return "Reasoning completed."
+	}
 }
 
 func chatToResponsesEvent(

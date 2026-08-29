@@ -53,20 +53,33 @@ func (s *OpenAIGatewayService) forwardResponsesViaRawChatCompletions(
 	toolSearch := apicompat.HasToolSearchTool(effectiveTools)
 	namespaceTools := apicompat.NamespaceToolNames(effectiveTools)
 
-	// 自愈回写：历史里带明文 summary 的 reasoning item 刷新进缓存，覆盖 Redis
-	// 被 flush / 跨实例漂移后同 id 的 encrypted-only 副本无法再取明文的情况。
-	s.recacheReasoningItemsFromInput(responsesReq.Input)
+	billingModel := resolveOpenAIForwardModel(account, originalModel, "")
+	upstreamModel := normalizeOpenAIModelForUpstream(account, billingModel)
+	deepSeekFallback := isDeepSeekRawChatCompletionsRequest(account, originalModel, billingModel, upstreamModel)
+	agentHarnessCandidate := deepSeekFallback && len(effectiveTools) > 0
+	if !agentHarnessCandidate {
+		// Keep the legacy self-heal ordering: plaintext reasoning in this request
+		// is available to encrypted-only replicas during the same conversion.
+		s.recacheReasoningItemsFromInput(responsesReq.Input)
+	}
 
 	chatReq, err := apicompat.ResponsesToChatCompletionsRequestWithOptions(&responsesReq, &apicompat.ResponsesToChatOptions{
-		ReasoningContentByID: s.reasoningContentByID,
+		ReasoningContentByID:       s.reasoningContentByID,
+		PreferReasoningContentByID: agentHarnessCandidate,
 	})
 	if err != nil {
 		writeOpenAIResponsesFallbackError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return nil, fmt.Errorf("convert responses to chat completions: %w", err)
 	}
+	agentHarnessMode := deepSeekFallback && len(chatReq.Tools) > 0
+	if agentHarnessMode {
+		applyDeepSeekAgentHarnessInstructions(chatReq)
+	} else if agentHarnessCandidate {
+		// 自愈回写：普通桥接仍用明文 summary 刷新缓存。Agent 模式公开的
+		// summary 是刻意压缩的状态文本，不能覆盖服务端保存的完整 reasoning。
+		s.recacheReasoningItemsFromInput(responsesReq.Input)
+	}
 
-	billingModel := resolveOpenAIForwardModel(account, originalModel, "")
-	upstreamModel := normalizeOpenAIModelForUpstream(account, billingModel)
 	reasoningEffort := extractOpenAIReasoningEffortFromBody(body, upstreamModel, billingModel, originalModel)
 	// 国产模型默认 effort 补充：需要 mappedModel 判定，推迟到 billingModel 算出之后。
 	reasoningEffort = ApplyThinkingEnabledFallback(reasoningEffort, body, billingModel)
@@ -121,9 +134,39 @@ func (s *OpenAIGatewayService) forwardResponsesViaRawChatCompletions(
 	}
 
 	if clientStream {
-		return s.streamChatCompletionsAsResponses(c, resp, originalModel, customTools, functionTools, toolSearch, namespaceTools, billingModel, upstreamModel, reasoningEffort, serviceTier, startTime)
+		return s.streamChatCompletionsAsResponses(c, resp, originalModel, customTools, functionTools, toolSearch, namespaceTools, billingModel, upstreamModel, reasoningEffort, serviceTier, agentHarnessMode, startTime)
 	}
-	return s.bufferChatCompletionsAsResponses(c, resp, originalModel, customTools, functionTools, toolSearch, namespaceTools, billingModel, upstreamModel, reasoningEffort, serviceTier, startTime)
+	return s.bufferChatCompletionsAsResponses(c, resp, originalModel, customTools, functionTools, toolSearch, namespaceTools, billingModel, upstreamModel, reasoningEffort, serviceTier, agentHarnessMode, startTime)
+}
+
+const deepSeekAgentHarnessInstructions = `You are running inside an external agent harness. Treat this request as exactly one turn of a tool-execution loop.
+The provided tools are real and executable. Do not simulate tool use, shell commands, file access, browsing, or tool results in prose.
+When external state or an action is needed, emit the appropriate tool call as soon as its name and arguments are known, then end this turn immediately. Do not narrate a plan instead of acting.
+When no tool is needed and the task is complete, give the final answer and end the turn.
+Keep internal reasoning bounded and action-oriented. A high or max reasoning setting requests care, not a long narrative or exhaustive exploration. Do not continue reasoning after choosing the next action or reaching the answer.`
+
+func applyDeepSeekAgentHarnessInstructions(req *apicompat.ChatCompletionsRequest) {
+	if req == nil {
+		return
+	}
+	for i := range req.Messages {
+		if req.Messages[i].Role != "system" {
+			break
+		}
+		var existing string
+		if err := json.Unmarshal(req.Messages[i].Content, &existing); err != nil {
+			break
+		}
+		combined := strings.TrimSpace(existing)
+		if combined != "" {
+			combined += "\n\n"
+		}
+		combined += deepSeekAgentHarnessInstructions
+		req.Messages[i].Content, _ = json.Marshal(combined)
+		return
+	}
+	content, _ := json.Marshal(deepSeekAgentHarnessInstructions)
+	req.Messages = append([]apicompat.ChatMessage{{Role: "system", Content: content}}, req.Messages...)
 }
 
 func (s *OpenAIGatewayService) bufferChatCompletionsAsResponses(
@@ -138,6 +181,7 @@ func (s *OpenAIGatewayService) bufferChatCompletionsAsResponses(
 	upstreamModel string,
 	reasoningEffort *string,
 	serviceTier *string,
+	agentHarnessMode bool,
 	startTime time.Time,
 ) (*OpenAIForwardResult, error) {
 	requestID := resp.Header.Get("x-request-id")
@@ -145,8 +189,16 @@ func (s *OpenAIGatewayService) bufferChatCompletionsAsResponses(
 	if err != nil {
 		return nil, err
 	}
-	responsesResp := apicompat.ChatCompletionsResponseToResponses(ccResp, originalModel, customTools, functionTools, toolSearch, namespaceTools)
-	s.cacheReasoningItemsFromOutput(responsesResp.Output)
+	var responseOptions *apicompat.ChatCompletionsToResponsesOptions
+	if agentHarnessMode {
+		responseOptions = &apicompat.ChatCompletionsToResponsesOptions{CompactReasoningSummary: true}
+	}
+	responsesResp := apicompat.ChatCompletionsResponseToResponsesWithOptions(ccResp, originalModel, customTools, functionTools, toolSearch, namespaceTools, responseOptions)
+	if agentHarnessMode {
+		s.cacheRawReasoningForOutput(responsesResp.Output, chatCompletionsResponseReasoning(ccResp))
+	} else {
+		s.cacheReasoningItemsFromOutput(responsesResp.Output)
+	}
 
 	if s.responseHeaderFilter != nil {
 		responseheaders.WriteFilteredHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
@@ -178,12 +230,14 @@ func (s *OpenAIGatewayService) streamChatCompletionsAsResponses(
 	upstreamModel string,
 	reasoningEffort *string,
 	serviceTier *string,
+	agentHarnessMode bool,
 	startTime time.Time,
 ) (*OpenAIForwardResult, error) {
 	requestID := resp.Header.Get("x-request-id")
 	writeStreamHeaders := s.newStreamHeaderWriter(c, resp.Header)
 
 	state := apicompat.NewChatCompletionsToResponsesStreamState(originalModel)
+	state.CompactReasoningSummary = agentHarnessMode
 	state.CustomTools = customTools
 	state.FunctionTools = functionTools
 	state.ToolSearchDeclared = toolSearch
@@ -218,7 +272,9 @@ func (s *OpenAIGatewayService) streamChatCompletionsAsResponses(
 
 	scan := s.scanCCStream(c, resp, "openai responses chat fallback", requestID, startTime, func(chunk *apicompat.ChatCompletionsChunk) {
 		events := apicompat.ChatCompletionsChunkToResponsesEvents(chunk, state)
-		s.cacheReasoningItemsFromEvents(events)
+		if !agentHarnessMode {
+			s.cacheReasoningItemsFromEvents(events)
+		}
 		writeEvents(events)
 	})
 
@@ -252,7 +308,13 @@ func (s *OpenAIGatewayService) streamChatCompletionsAsResponses(
 	}
 
 	finalEvents := apicompat.FinalizeChatCompletionsResponsesStream(state)
-	s.cacheReasoningItemsFromEvents(finalEvents)
+	if agentHarnessMode {
+		if state.ReasoningItemID != "" && state.Reasoning.Len() > 0 {
+			s.setReasoningContent(state.ReasoningItemID, state.Reasoning.String())
+		}
+	} else {
+		s.cacheReasoningItemsFromEvents(finalEvents)
+	}
 	writeEvents(finalEvents)
 	if !clientDisconnected {
 		writeStreamHeaders()
@@ -354,6 +416,29 @@ func (s *OpenAIGatewayService) cacheReasoningItemsFromEvents(events []apicompat.
 func (s *OpenAIGatewayService) cacheReasoningItemsFromOutput(output []apicompat.ResponsesOutput) {
 	for i := range output {
 		s.cacheReasoningItem(&output[i])
+	}
+}
+
+func chatCompletionsResponseReasoning(resp *apicompat.ChatCompletionsResponse) string {
+	if resp == nil || len(resp.Choices) == 0 {
+		return ""
+	}
+	message := resp.Choices[0].Message
+	if message.ReasoningContent != "" {
+		return message.ReasoningContent
+	}
+	return message.Reasoning
+}
+
+func (s *OpenAIGatewayService) cacheRawReasoningForOutput(output []apicompat.ResponsesOutput, reasoning string) {
+	if strings.TrimSpace(reasoning) == "" {
+		return
+	}
+	for i := range output {
+		if output[i].Type == "reasoning" && output[i].ID != "" {
+			s.setReasoningContent(output[i].ID, reasoning)
+			return
+		}
 	}
 }
 

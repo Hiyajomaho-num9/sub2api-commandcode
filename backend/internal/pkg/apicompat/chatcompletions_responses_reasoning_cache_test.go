@@ -91,6 +91,30 @@ func TestResponsesToChat_ReasoningCacheLookup_PlaintextPreferred(t *testing.T) {
 	require.False(t, lookupCalled, "plaintext summary present → cache lookup must not run")
 }
 
+func TestResponsesToChat_ReasoningCacheLookup_CanPreferFullCachedReasoning(t *testing.T) {
+	req := &ResponsesRequest{
+		Model: "deepseek-reasoner",
+		Input: json.RawMessage(`[
+			{"type":"reasoning","id":"item_compact","summary":[{"type":"summary_text","text":"Selected the next tool action."}]},
+			{"type":"function_call","call_id":"call_1","name":"exec","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_1","output":"ok"}
+		]`),
+	}
+
+	out, err := ResponsesToChatCompletionsRequestWithOptions(req, &ResponsesToChatOptions{
+		PreferReasoningContentByID: true,
+		ReasoningContentByID: func(itemID string) string {
+			if itemID == "item_compact" {
+				return "full provider reasoning"
+			}
+			return ""
+		},
+	})
+	require.NoError(t, err)
+	require.Len(t, out.Messages, 2)
+	require.Equal(t, "full provider reasoning", out.Messages[0].ReasoningContent)
+}
+
 // DeepSeek emits reasoning only once per turn; chained tool calls
 // (reasoning → call A → output A → call B) have no reasoning item before call
 // B. The turn's reasoning must be replayed on B's assistant message, otherwise

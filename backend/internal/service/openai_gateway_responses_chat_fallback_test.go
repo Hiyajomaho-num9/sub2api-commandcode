@@ -180,6 +180,68 @@ func TestForwardResponses_ForceChatCompletionsRoutesStreamingToChatCompletions(t
 	require.NotNil(t, result.FirstTokenMs)
 }
 
+func TestForwardResponses_DeepSeekAgentHarnessCompactsReasoningAndCachesFullText(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	body := []byte(`{
+		"model":"deepseek-v4-flash",
+		"instructions":"Keep the repository clean.",
+		"input":"inspect the workspace",
+		"tools":[{"type":"function","name":"exec_command","description":"Run a command","parameters":{"type":"object","properties":{"cmd":{"type":"string"}},"required":["cmd"]}}],
+		"stream":true
+	}`)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	upstreamBody := strings.Join([]string{
+		`data: {"id":"chatcmpl_agent","object":"chat.completion.chunk","model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"reasoning_content":"long private reasoning that must stay server side"},"finish_reason":null}]}`,
+		"",
+		`data: {"id":"chatcmpl_agent","object":"chat.completion.chunk","model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_agent","type":"function","function":{"name":"exec_command","arguments":"{\"cmd\":\"pwd\"}"}}]},"finish_reason":"tool_calls"}]}`,
+		"",
+		`data: {"id":"chatcmpl_agent","object":"chat.completion.chunk","model":"deepseek-v4-flash","choices":[],"usage":{"prompt_tokens":20,"completion_tokens":8,"total_tokens":28}}`,
+		"",
+		"data: [DONE]",
+		"",
+	}, "\n")
+	upstream := &httpUpstreamRecorder{resp: &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(upstreamBody)),
+	}}
+	cache := &reasoningRecordingCache{}
+	svc := &OpenAIGatewayService{
+		cfg:          rawChatCompletionsTestConfig(),
+		httpUpstream: upstream,
+		cache:        cache,
+	}
+
+	result, err := svc.Forward(context.Background(), c, forceChatResponsesFallbackAccount(), body)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.True(t, result.Stream)
+
+	systemPrompt := gjson.GetBytes(upstream.lastBody, "messages.0.content").String()
+	require.Contains(t, systemPrompt, "Keep the repository clean.")
+	require.Contains(t, systemPrompt, "external agent harness")
+	require.Contains(t, systemPrompt, "end this turn immediately")
+	require.Equal(t, "user", gjson.GetBytes(upstream.lastBody, "messages.1.role").String())
+	require.Equal(t, "exec_command", gjson.GetBytes(upstream.lastBody, "tools.0.function.name").String())
+
+	clientBody := rec.Body.String()
+	require.Contains(t, clientBody, "Selected the next tool action.")
+	require.NotContains(t, clientBody, "long private reasoning")
+	require.Contains(t, clientBody, "response.function_call_arguments.done")
+	require.Contains(t, clientBody, "data: [DONE]")
+
+	sets := cache.snapshotSets()
+	require.Len(t, sets, 1)
+	for _, reasoning := range sets {
+		require.Equal(t, "long private reasoning that must stay server side", reasoning)
+	}
+}
+
 func TestForwardResponses_ChatFallbackRejectsInvalidToolArgumentsAtOutputLimit(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
