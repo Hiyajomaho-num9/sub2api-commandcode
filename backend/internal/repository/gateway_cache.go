@@ -228,6 +228,7 @@ var _ service.CyberSessionBlockStore = (*gatewayCache)(nil)
 var _ service.LiveCallStore = (*gatewayCache)(nil)
 
 const reasoningContentPrefix = "reasoning_content:"
+const responsesChatFallbackStatePrefix = "responses_chat_state:"
 
 // reasoningContentDefaultTTL 是 reasoning 缓存的默认过期时间。Codex 会话可能
 // 跨多天恢复，取 7 天；调用方传入非正 TTL 时兜底。
@@ -267,6 +268,46 @@ func (c *gatewayCache) GetReasoningContent(ctx context.Context, itemID string) (
 		return "", err
 	}
 	return val, nil
+}
+
+func responsesChatFallbackStateKey(accountID int64, responseID string) string {
+	return fmt.Sprintf("%s%d:%s", responsesChatFallbackStatePrefix, accountID, responseID)
+}
+
+// SetResponsesChatFallbackState stores the Chat history needed to implement
+// Responses previous_response_id semantics on a Chat Completions upstream.
+func (c *gatewayCache) SetResponsesChatFallbackState(ctx context.Context, accountID int64, responseID string, payload []byte, ttl time.Duration) error {
+	if c == nil || c.rdb == nil {
+		return errors.New("gateway cache unavailable")
+	}
+	responseID = strings.TrimSpace(responseID)
+	if responseID == "" || len(payload) == 0 {
+		return nil
+	}
+	if ttl <= 0 {
+		ttl = reasoningContentDefaultTTL
+	}
+	return c.rdb.Set(ctx, responsesChatFallbackStateKey(accountID, responseID), payload, ttl).Err()
+}
+
+// GetResponsesChatFallbackState returns nil, nil on a cache miss so callers
+// can distinguish an expired previous_response_id from a Redis failure.
+func (c *gatewayCache) GetResponsesChatFallbackState(ctx context.Context, accountID int64, responseID string) ([]byte, error) {
+	if c == nil || c.rdb == nil {
+		return nil, errors.New("gateway cache unavailable")
+	}
+	responseID = strings.TrimSpace(responseID)
+	if responseID == "" {
+		return nil, nil
+	}
+	payload, err := c.rdb.Get(ctx, responsesChatFallbackStateKey(accountID, responseID)).Bytes()
+	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return payload, nil
 }
 
 const (

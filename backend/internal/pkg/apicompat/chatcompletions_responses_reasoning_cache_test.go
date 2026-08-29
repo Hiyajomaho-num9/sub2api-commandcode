@@ -41,6 +41,41 @@ func TestResponsesToChat_ReasoningCacheLookup_RestoresEncryptedOnlyItem(t *testi
 	require.Equal(t, "user", out.Messages[2].Role)
 }
 
+func TestResponsesToChat_PreviousResponsePrefixPairsCurrentToolOutput(t *testing.T) {
+	prefix := []ChatMessage{
+		{Role: "user", Content: json.RawMessage(`"inspect the workspace"`)},
+		{
+			Role:             "assistant",
+			ReasoningContent: "full private reasoning",
+			ToolCalls: []ChatToolCall{{
+				ID:   "call_prev",
+				Type: "function",
+				Function: ChatFunctionCall{
+					Name:      "exec_command",
+					Arguments: `{"cmd":"pwd"}`,
+				},
+			}},
+		},
+	}
+	req := &ResponsesRequest{
+		Model: "deepseek-v4-flash",
+		Input: json.RawMessage(`[
+			{"type":"function_call_output","call_id":"call_prev","output":"/home/kuro"}
+		]`),
+	}
+
+	out, err := ResponsesToChatCompletionsRequestWithOptions(req, &ResponsesToChatOptions{PrefixMessages: prefix})
+	require.NoError(t, err)
+	require.Len(t, out.Messages, 3)
+	require.Equal(t, "user", out.Messages[0].Role)
+	require.Equal(t, "assistant", out.Messages[1].Role)
+	require.Equal(t, "full private reasoning", out.Messages[1].ReasoningContent)
+	require.Len(t, out.Messages[1].ToolCalls, 1)
+	require.Equal(t, "call_prev", out.Messages[1].ToolCalls[0].ID)
+	require.Equal(t, "tool", out.Messages[2].Role)
+	require.Equal(t, "call_prev", out.Messages[2].ToolCallID)
+}
+
 // A cache miss keeps the original behavior: no reasoning_content, no error.
 func TestResponsesToChat_ReasoningCacheLookup_MissKeepsOriginalBehavior(t *testing.T) {
 	req := &ResponsesRequest{

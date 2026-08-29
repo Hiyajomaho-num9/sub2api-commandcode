@@ -368,9 +368,10 @@ func forceChatResponsesFallbackAccount() *Account {
 // reasoningRecordingCache 记录 reasoning 缓存写入、并按需响应回查。
 type reasoningRecordingCache struct {
 	stubGatewayCache
-	mu      sync.Mutex
-	sets    map[string]string
-	getResp map[string]string
+	mu             sync.Mutex
+	sets           map[string]string
+	getResp        map[string]string
+	responseStates map[string][]byte
 }
 
 func (c *reasoningRecordingCache) SetReasoningContent(_ context.Context, itemID string, content string, _ time.Duration) error {
@@ -398,6 +399,135 @@ func (c *reasoningRecordingCache) snapshotSets() map[string]string {
 		out[k] = v
 	}
 	return out
+}
+
+func (c *reasoningRecordingCache) SetResponsesChatFallbackState(_ context.Context, _ int64, responseID string, payload []byte, _ time.Duration) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.responseStates == nil {
+		c.responseStates = make(map[string][]byte)
+	}
+	c.responseStates[responseID] = append([]byte(nil), payload...)
+	return nil
+}
+
+func (c *reasoningRecordingCache) GetResponsesChatFallbackState(_ context.Context, _ int64, responseID string) ([]byte, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]byte(nil), c.responseStates[responseID]...), nil
+}
+
+func TestForwardResponses_DeepSeekPreviousResponseRestoresToolTurn(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	firstUpstreamBody := strings.Join([]string{
+		`data: {"id":"chatcmpl_agent_chain","object":"chat.completion.chunk","model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"reasoning_content":"full private reasoning"},"finish_reason":null}]}`,
+		"",
+		`data: {"id":"chatcmpl_agent_chain","object":"chat.completion.chunk","model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"content":"I need the intermediate result first."},"finish_reason":null}]}`,
+		"",
+		`data: {"id":"chatcmpl_agent_chain","object":"chat.completion.chunk","model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_chain","type":"function","function":{"name":"exec_command","arguments":"{\"cmd\":\"pwd\"}"}}]},"finish_reason":"tool_calls"}]}`,
+		"",
+		`data: {"id":"chatcmpl_agent_chain","object":"chat.completion.chunk","model":"deepseek-v4-flash","choices":[],"usage":{"prompt_tokens":20,"completion_tokens":8,"total_tokens":28}}`,
+		"",
+		"data: [DONE]",
+		"",
+	}, "\n")
+	upstream := &httpUpstreamRecorder{responses: []*http.Response{
+		{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(firstUpstreamBody)),
+		},
+		{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body: io.NopCloser(strings.NewReader(
+				`{"id":"chatcmpl_agent_final","object":"chat.completion","model":"deepseek-v4-flash","choices":[{"index":0,"message":{"role":"assistant","content":"workspace inspected"},"finish_reason":"stop"}],"usage":{"prompt_tokens":30,"completion_tokens":4,"total_tokens":34}}`,
+			)),
+		},
+	}}
+	cache := &reasoningRecordingCache{}
+	svc := &OpenAIGatewayService{
+		cfg:          rawChatCompletionsTestConfig(),
+		httpUpstream: upstream,
+		cache:        cache,
+	}
+	account := forceChatResponsesFallbackAccount()
+
+	firstBody := []byte(`{
+		"model":"deepseek-v4-flash",
+		"instructions":"Keep the repository clean.",
+		"input":"inspect the workspace",
+		"tools":[{"type":"function","name":"exec_command","description":"Run a command","parameters":{"type":"object","properties":{"cmd":{"type":"string"}},"required":["cmd"]}}],
+		"stream":true
+	}`)
+	firstRecorder := httptest.NewRecorder()
+	firstContext, _ := gin.CreateTestContext(firstRecorder)
+	firstContext.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(firstBody))
+	firstContext.Request.Header.Set("Content-Type", "application/json")
+	firstResult, err := svc.Forward(context.Background(), firstContext, account, firstBody)
+	require.NoError(t, err)
+	require.NotNil(t, firstResult)
+	require.NotContains(t, firstRecorder.Body.String(), "intermediate result")
+	require.Contains(t, firstRecorder.Body.String(), compactAgentReasoningProgressForTest)
+
+	secondBody := []byte(`{
+		"model":"deepseek-v4-flash",
+		"instructions":"Keep the repository clean.",
+		"previous_response_id":"chatcmpl_agent_chain",
+		"input":[{"type":"function_call_output","call_id":"call_chain","output":"/home/kuro"}],
+		"tools":[{"type":"function","name":"exec_command","description":"Run a command","parameters":{"type":"object","properties":{"cmd":{"type":"string"}},"required":["cmd"]}}],
+		"stream":false
+	}`)
+	secondRecorder := httptest.NewRecorder()
+	secondContext, _ := gin.CreateTestContext(secondRecorder)
+	secondContext.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(secondBody))
+	secondContext.Request.Header.Set("Content-Type", "application/json")
+	secondResult, err := svc.Forward(context.Background(), secondContext, account, secondBody)
+	require.NoError(t, err)
+	require.NotNil(t, secondResult)
+	require.Len(t, upstream.bodies, 2)
+
+	continued := upstream.bodies[1]
+	require.Equal(t, "user", gjson.GetBytes(continued, "messages.1.role").String())
+	require.Equal(t, "assistant", gjson.GetBytes(continued, "messages.2.role").String())
+	require.Equal(t, "full private reasoning", gjson.GetBytes(continued, "messages.2.reasoning_content").String())
+	require.Equal(t, "call_chain", gjson.GetBytes(continued, "messages.2.tool_calls.0.id").String())
+	require.False(t, gjson.GetBytes(continued, "messages.2.content").Exists())
+	require.Equal(t, "tool", gjson.GetBytes(continued, "messages.3.role").String())
+	require.Equal(t, "call_chain", gjson.GetBytes(continued, "messages.3.tool_call_id").String())
+	require.Equal(t, "/home/kuro", gjson.GetBytes(continued, "messages.3.content").String())
+	require.Equal(t, "workspace inspected", gjson.Get(secondRecorder.Body.String(), "output.0.content.0.text").String())
+}
+
+const compactAgentReasoningProgressForTest = "Working through the current step."
+
+func TestForwardResponses_MissingPreviousFallbackStateFailsExplicitly(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	body := []byte(`{
+		"model":"deepseek-v4-flash",
+		"previous_response_id":"chatcmpl_missing",
+		"input":[{"type":"function_call_output","call_id":"call_missing","output":"ok"}],
+		"tools":[{"type":"function","name":"exec_command","parameters":{"type":"object"}}],
+		"stream":false
+	}`)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	upstream := &httpUpstreamRecorder{}
+	svc := &OpenAIGatewayService{
+		cfg:          rawChatCompletionsTestConfig(),
+		httpUpstream: upstream,
+		cache:        &reasoningRecordingCache{},
+	}
+
+	result, err := svc.Forward(context.Background(), c, forceChatResponsesFallbackAccount(), body)
+	require.ErrorIs(t, err, errResponsesChatFallbackStateNotFound)
+	require.Nil(t, result)
+	require.Equal(t, http.StatusBadRequest, recorder.Code)
+	require.Contains(t, recorder.Body.String(), "previous_response_id state is unavailable")
+	require.Empty(t, upstream.requests)
 }
 
 // 流式响应里的 reasoning_content 应按 reasoning item id 写入缓存，供后续轮次

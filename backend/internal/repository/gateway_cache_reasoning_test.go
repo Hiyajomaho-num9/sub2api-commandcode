@@ -39,3 +39,24 @@ func TestGatewayCacheReasoningContent(t *testing.T) {
 	_, err = cache.GetReasoningContent(ctx, "item_empty")
 	require.ErrorIs(t, err, service.ErrReasoningContentNotFound)
 }
+
+func TestGatewayCacheResponsesChatFallbackState(t *testing.T) {
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	cache := &gatewayCache{rdb: client}
+	ctx := context.Background()
+
+	payload := []byte(`{"messages":[{"role":"assistant"}]}`)
+	require.NoError(t, cache.SetResponsesChatFallbackState(ctx, 7, "resp_abc", payload, time.Minute))
+	got, err := cache.GetResponsesChatFallbackState(ctx, 7, "resp_abc")
+	require.NoError(t, err)
+	require.Equal(t, payload, got)
+
+	otherAccount, err := cache.GetResponsesChatFallbackState(ctx, 8, "resp_abc")
+	require.NoError(t, err)
+	require.Nil(t, otherAccount)
+
+	missing, err := cache.GetResponsesChatFallbackState(ctx, 7, "resp_missing")
+	require.NoError(t, err)
+	require.Nil(t, missing)
+}

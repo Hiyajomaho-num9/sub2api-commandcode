@@ -37,6 +37,12 @@ type ResponsesToChatOptions struct {
 	// short public summary while retaining the provider's full reasoning in the
 	// gateway cache for DeepSeek's required history passback.
 	PreferReasoningContentByID bool
+
+	// PrefixMessages restores the conversation represented by a Responses
+	// previous_response_id before the current input is converted. The bridge
+	// normalizes the combined history once, so a current function_call_output
+	// remains adjacent to the assistant tool call from the previous response.
+	PrefixMessages []ChatMessage
 }
 
 // ChatCompletionsToResponsesOptions controls optional response-side bridge
@@ -46,6 +52,12 @@ type ChatCompletionsToResponsesOptions struct {
 	// Responses summary. The full text remains in stream state so the gateway can
 	// cache and pass it back on later DeepSeek tool turns.
 	CompactReasoningSummary bool
+
+	// SuppressTextWithToolCalls buffers assistant text until the Chat turn is
+	// complete and omits it when the same turn contains tool calls. This keeps
+	// web-style narration such as "I need to inspect..." out of an agent tool
+	// turn while preserving genuine final answers on no-tool turns.
+	SuppressTextWithToolCalls bool
 }
 
 // ResponsesToChatCompletionsRequest converts a Responses API request into a
@@ -300,6 +312,9 @@ func responsesInputToChatMessagesWithOptions(instructions string, inputRaw json.
 	if strings.TrimSpace(instructions) != "" {
 		content, _ := json.Marshal(instructions)
 		messages = append(messages, ChatMessage{Role: "system", Content: content})
+	}
+	if opts != nil && len(opts.PrefixMessages) > 0 {
+		messages = append(messages, opts.PrefixMessages...)
 	}
 
 	inputRaw = bytesTrimSpace(inputRaw)
@@ -1314,6 +1329,9 @@ func chatMessageToResponsesOutput(message ChatMessage, customTools, functionTool
 	}
 
 	text := chatMessageContentText(message.Content)
+	if opts != nil && opts.SuppressTextWithToolCalls && len(message.ToolCalls) > 0 {
+		text = ""
+	}
 	if text == "" && strings.TrimSpace(reasoning) != "" && len(message.ToolCalls) == 0 &&
 		(opts == nil || !opts.CompactReasoningSummary) {
 		text = reasoning
@@ -1495,6 +1513,13 @@ type ChatCompletionsToResponsesStreamState struct {
 	// adapting a Chat model to an agent-oriented Responses client.
 	CompactReasoningSummary bool
 	ReasoningSummaryText    string
+	ReasoningSummaryStarted bool
+	ReasoningOutcomeEmitted bool
+
+	// SuppressTextWithToolCalls buffers text until finalization. If the turn
+	// contains a tool call, the buffered narration is omitted; otherwise it is
+	// emitted as the final assistant message.
+	SuppressTextWithToolCalls bool
 
 	// Message item + output_text content-part lifecycle.
 	MessageItemID string
@@ -1627,7 +1652,9 @@ func ChatCompletionsChunkToResponsesEvents(
 		reasoning := choice.Delta.reasoningText()
 		if reasoning != nil && *reasoning != "" {
 			_, _ = state.Reasoning.WriteString(*reasoning)
-			if !state.CompactReasoningSummary {
+			if state.CompactReasoningSummary {
+				events = append(events, startCompactChatReasoningSummary(state)...)
+			} else {
 				events = append(events, ensureChatReasoningItem(state)...)
 				events = append(events, chatToResponsesEvent(state, "response.reasoning_summary_text.delta", &ResponsesStreamEvent{
 					OutputIndex:  state.ReasoningIndex,
@@ -1638,19 +1665,21 @@ func ChatCompletionsChunkToResponsesEvents(
 			}
 		}
 		if choice.Delta.Content != nil && *choice.Delta.Content != "" {
-			// First real content closes the reasoning item, then opens the
-			// message item and its output_text content part.
-			state.ReasoningSummaryText = compactChatReasoningSummary(false, true)
-			events = append(events, closeChatReasoningItem(state)...)
-			events = append(events, ensureChatToResponsesMessageItem(state)...)
-			events = append(events, ensureChatToResponsesTextPart(state)...)
 			_, _ = state.Text.WriteString(*choice.Delta.Content)
-			events = append(events, chatToResponsesEvent(state, "response.output_text.delta", &ResponsesStreamEvent{
-				OutputIndex:  state.MessageIndex,
-				ContentIndex: 0,
-				Delta:        *choice.Delta.Content,
-				ItemID:       state.MessageItemID,
-			}))
+			if !state.SuppressTextWithToolCalls {
+				// First real content closes the reasoning item, then opens the
+				// message item and its output_text content part.
+				events = append(events, finishCompactChatReasoningSummary(state, false, true)...)
+				events = append(events, closeChatReasoningItem(state)...)
+				events = append(events, ensureChatToResponsesMessageItem(state)...)
+				events = append(events, ensureChatToResponsesTextPart(state)...)
+				events = append(events, chatToResponsesEvent(state, "response.output_text.delta", &ResponsesStreamEvent{
+					OutputIndex:  state.MessageIndex,
+					ContentIndex: 0,
+					Delta:        *choice.Delta.Content,
+					ItemID:       state.MessageItemID,
+				}))
+			}
 		}
 		for _, toolCall := range choice.Delta.ToolCalls {
 			idx := 0
@@ -1660,7 +1689,7 @@ func ChatCompletionsChunkToResponsesEvents(
 			stored, ok := state.ToolCalls[idx]
 			if !ok {
 				// A tool call closes any open reasoning item first.
-				state.ReasoningSummaryText = compactChatReasoningSummary(true, false)
+				events = append(events, finishCompactChatReasoningSummary(state, true, false)...)
 				events = append(events, closeChatReasoningItem(state)...)
 				copyCall := toolCall
 				if copyCall.ID == "" {
@@ -1722,7 +1751,18 @@ func FinalizeChatCompletionsResponsesStream(state *ChatCompletionsToResponsesStr
 
 	// Close a reasoning item that never transitioned to content (reasoning-only
 	// or empty completion).
+	events = append(events, finishCompactChatReasoningSummary(state, len(state.ToolCalls) > 0, state.Text.Len() > 0)...)
 	events = append(events, closeChatReasoningItem(state)...)
+	if state.SuppressTextWithToolCalls && len(state.ToolCalls) == 0 && state.Text.Len() > 0 {
+		events = append(events, ensureChatToResponsesMessageItem(state)...)
+		events = append(events, ensureChatToResponsesTextPart(state)...)
+		events = append(events, chatToResponsesEvent(state, "response.output_text.delta", &ResponsesStreamEvent{
+			OutputIndex:  state.MessageIndex,
+			ContentIndex: 0,
+			Delta:        state.Text.String(),
+			ItemID:       state.MessageItemID,
+		}))
+	}
 	events = append(events, synthesizeChatReasoningFallbackMessage(state)...)
 
 	if state.MessageItemID != "" {
@@ -1824,6 +1864,43 @@ func ensureChatReasoningItem(state *ChatCompletionsToResponsesStreamState) []Res
 	}
 }
 
+const compactChatReasoningProgress = "Working through the current step."
+
+func startCompactChatReasoningSummary(state *ChatCompletionsToResponsesStreamState) []ResponsesStreamEvent {
+	if state == nil || !state.CompactReasoningSummary || state.ReasoningSummaryStarted || state.Reasoning.Len() == 0 {
+		return nil
+	}
+	events := ensureChatReasoningItem(state)
+	state.ReasoningSummaryStarted = true
+	state.ReasoningSummaryText = compactChatReasoningProgress
+	return append(events, chatToResponsesEvent(state, "response.reasoning_summary_text.delta", &ResponsesStreamEvent{
+		OutputIndex:  state.ReasoningIndex,
+		SummaryIndex: 0,
+		Delta:        compactChatReasoningProgress,
+		ItemID:       state.ReasoningItemID,
+	}))
+}
+
+func finishCompactChatReasoningSummary(state *ChatCompletionsToResponsesStreamState, hasToolCall, hasText bool) []ResponsesStreamEvent {
+	if state == nil || !state.CompactReasoningSummary || state.ReasoningDone || state.ReasoningOutcomeEmitted || state.Reasoning.Len() == 0 {
+		return nil
+	}
+	events := startCompactChatReasoningSummary(state)
+	outcome := compactChatReasoningSummary(hasToolCall, hasText)
+	delta := outcome
+	if state.ReasoningSummaryText != "" {
+		delta = " " + outcome
+	}
+	state.ReasoningSummaryText += delta
+	state.ReasoningOutcomeEmitted = true
+	return append(events, chatToResponsesEvent(state, "response.reasoning_summary_text.delta", &ResponsesStreamEvent{
+		OutputIndex:  state.ReasoningIndex,
+		SummaryIndex: 0,
+		Delta:        delta,
+		ItemID:       state.ReasoningItemID,
+	}))
+}
+
 // closeChatReasoningItem emits the reasoning item's terminal events
 // (reasoning_summary_text.done + reasoning_summary_part.done + output_item.done).
 func closeChatReasoningItem(state *ChatCompletionsToResponsesStreamState) []ResponsesStreamEvent {
@@ -1843,12 +1920,15 @@ func closeChatReasoningItem(state *ChatCompletionsToResponsesStreamState) []Resp
 		if summary == "" {
 			summary = compactChatReasoningSummary(false, false)
 		}
-		events = append(events, chatToResponsesEvent(state, "response.reasoning_summary_text.delta", &ResponsesStreamEvent{
-			OutputIndex:  state.ReasoningIndex,
-			SummaryIndex: 0,
-			Delta:        summary,
-			ItemID:       state.ReasoningItemID,
-		}))
+		if !state.ReasoningSummaryStarted {
+			state.ReasoningSummaryStarted = true
+			events = append(events, chatToResponsesEvent(state, "response.reasoning_summary_text.delta", &ResponsesStreamEvent{
+				OutputIndex:  state.ReasoningIndex,
+				SummaryIndex: 0,
+				Delta:        summary,
+				ItemID:       state.ReasoningItemID,
+			}))
+		}
 	}
 	events = append(events, []ResponsesStreamEvent{
 		chatToResponsesEvent(state, "response.reasoning_summary_text.done", &ResponsesStreamEvent{
@@ -2142,7 +2222,7 @@ func (state *ChatCompletionsToResponsesStreamState) chatOutput() []ResponsesOutp
 		if state.toolIsCustom[i] {
 			outputs = append(outputs, ResponsesOutput{
 				Type:   "custom_tool_call",
-				ID:     generateItemID(),
+				ID:     nonEmpty(state.ToolItemIDs[i], generateItemID()),
 				CallID: toolCall.ID,
 				Name:   customNameForStreamTool(state, toolCall.Function.Name),
 				Input:  extractCustomToolCallInput(arguments),
@@ -2153,7 +2233,7 @@ func (state *ChatCompletionsToResponsesStreamState) chatOutput() []ResponsesOutp
 		if state.toolIsToolSearch[i] {
 			outputs = append(outputs, ResponsesOutput{
 				Type:      "tool_search_call",
-				ID:        generateItemID(),
+				ID:        nonEmpty(state.ToolItemIDs[i], generateItemID()),
 				CallID:    toolCall.ID,
 				Arguments: arguments,
 				Status:    "completed",
@@ -2166,7 +2246,7 @@ func (state *ChatCompletionsToResponsesStreamState) chatOutput() []ResponsesOutp
 		}
 		outputs = append(outputs, ResponsesOutput{
 			Type:      "function_call",
-			ID:        generateItemID(),
+			ID:        nonEmpty(state.ToolItemIDs[i], generateItemID()),
 			CallID:    toolCall.ID,
 			Name:      name,
 			Namespace: namespace,
@@ -2175,6 +2255,28 @@ func (state *ChatCompletionsToResponsesStreamState) chatOutput() []ResponsesOutp
 		})
 	}
 	return outputs
+}
+
+// ChatMessage returns the accumulated upstream assistant turn for persistence
+// behind previous_response_id. In agent mode, tool-turn narration is omitted
+// from both the public Responses stream and the replayed Chat history.
+func (state *ChatCompletionsToResponsesStreamState) ChatMessage() ChatMessage {
+	if state == nil {
+		return ChatMessage{Role: "assistant"}
+	}
+	message := ChatMessage{
+		Role:             "assistant",
+		ReasoningContent: state.Reasoning.String(),
+	}
+	if text := state.Text.String(); text != "" && !(state.SuppressTextWithToolCalls && len(state.ToolCalls) > 0) {
+		message.Content, _ = json.Marshal(text)
+	}
+	for i := 0; i < len(state.ToolCalls); i++ {
+		if toolCall := state.ToolCalls[i]; toolCall != nil {
+			message.ToolCalls = append(message.ToolCalls, *toolCall)
+		}
+	}
+	return message
 }
 
 func compactChatReasoningSummary(hasToolCall, hasText bool) string {

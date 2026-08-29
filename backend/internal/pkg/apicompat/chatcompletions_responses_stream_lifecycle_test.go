@@ -160,8 +160,10 @@ func TestStream_CompactReasoningSummaryKeepsRawReasoningPrivate(t *testing.T) {
 		events = append(events, ChatCompletionsChunkToResponsesEvents(&chunk, state)...)
 	}
 	for _, event := range events {
-		require.NotEqual(t, "response.reasoning_summary_text.delta", event.Type,
-			"raw reasoning chunks must not be streamed as public summary text")
+		require.NotContains(t, event.Delta, "private step")
+		if event.Type == "response.reasoning_summary_text.delta" {
+			require.Equal(t, compactChatReasoningProgress, event.Delta)
+		}
 	}
 
 	var toolChunk ChatCompletionsChunk
@@ -171,25 +173,121 @@ func TestStream_CompactReasoningSummaryKeepsRawReasoningPrivate(t *testing.T) {
 	events = append(events, ChatCompletionsChunkToResponsesEvents(&toolChunk, state)...)
 	events = append(events, FinalizeChatCompletionsResponsesStream(state)...)
 
-	var reasoningItemID string
+	var reasoningItemID, toolItemID string
+	var summaryDeltas strings.Builder
 	for _, event := range events {
 		require.NotContains(t, event.Delta, "private step")
 		require.NotContains(t, event.Text, "private step")
 		if event.Type == "response.reasoning_summary_text.delta" {
-			require.Equal(t, "Selected the next tool action.", event.Delta)
+			_, _ = summaryDeltas.WriteString(event.Delta)
 		}
 		if event.Type == "response.output_item.done" && event.Item != nil && event.Item.Type == "reasoning" {
 			reasoningItemID = event.Item.ID
-			require.Equal(t, "Selected the next tool action.", event.Item.Summary[0].Text)
+			require.Equal(t, "Working through the current step. Selected the next tool action.", event.Item.Summary[0].Text)
+		}
+		if event.Type == "response.output_item.done" && event.Item != nil && event.Item.Type == "function_call" {
+			toolItemID = event.Item.ID
 		}
 		if event.Type == "response.completed" {
 			require.NotNil(t, event.Response)
 			require.Equal(t, reasoningItemID, event.Response.Output[0].ID)
-			require.Equal(t, "Selected the next tool action.", event.Response.Output[0].Summary[0].Text)
+			require.Equal(t, "Working through the current step. Selected the next tool action.", event.Response.Output[0].Summary[0].Text)
+			require.Equal(t, toolItemID, event.Response.Output[1].ID)
 		}
 	}
 	require.Equal(t, "private step one. private step two.", state.Reasoning.String())
+	require.Equal(t, "Working through the current step. Selected the next tool action.", summaryDeltas.String())
 	require.NotEmpty(t, reasoningItemID)
+	require.NotEmpty(t, toolItemID)
+}
+
+func TestStream_AgentHarnessSuppressesNarrationOnToolTurn(t *testing.T) {
+	state := NewChatCompletionsToResponsesStreamState("deepseek-v4-flash")
+	state.CompactReasoningSummary = true
+	state.SuppressTextWithToolCalls = true
+
+	chunks := []string{
+		`{"choices":[{"index":0,"delta":{"reasoning_content":"inspect privately"}}]}`,
+		`{"choices":[{"index":0,"delta":{"content":"I need the intermediate result first."}}]}`,
+		`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"exec","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`,
+	}
+	var events []ResponsesStreamEvent
+	for _, payload := range chunks {
+		var chunk ChatCompletionsChunk
+		require.NoError(t, json.Unmarshal([]byte(payload), &chunk))
+		events = append(events, ChatCompletionsChunkToResponsesEvents(&chunk, state)...)
+	}
+	events = append(events, FinalizeChatCompletionsResponsesStream(state)...)
+
+	var addedToolID, doneToolID string
+	for _, event := range events {
+		require.NotEqual(t, "response.output_text.delta", event.Type)
+		require.NotContains(t, event.Delta, "intermediate result")
+		if event.Type == "response.output_item.added" && event.Item != nil && event.Item.Type == "function_call" {
+			addedToolID = event.Item.ID
+		}
+		if event.Type == "response.output_item.done" && event.Item != nil && event.Item.Type == "function_call" {
+			doneToolID = event.Item.ID
+		}
+		if event.Type == "response.completed" {
+			require.NotNil(t, event.Response)
+			require.Len(t, event.Response.Output, 2)
+			require.Equal(t, "reasoning", event.Response.Output[0].Type)
+			require.Equal(t, "function_call", event.Response.Output[1].Type)
+			require.Equal(t, doneToolID, event.Response.Output[1].ID)
+		}
+	}
+	require.NotEmpty(t, addedToolID)
+	require.Equal(t, addedToolID, doneToolID)
+	require.Empty(t, chatMessageContentText(state.ChatMessage().Content))
+}
+
+func TestStream_AgentHarnessFlushesBufferedFinalAnswerWithoutTool(t *testing.T) {
+	state := NewChatCompletionsToResponsesStreamState("deepseek-v4-flash")
+	state.CompactReasoningSummary = true
+	state.SuppressTextWithToolCalls = true
+
+	var chunk ChatCompletionsChunk
+	require.NoError(t, json.Unmarshal([]byte(
+		`{"choices":[{"index":0,"delta":{"content":"final answer"},"finish_reason":"stop"}]}`,
+	), &chunk))
+	events := ChatCompletionsChunkToResponsesEvents(&chunk, state)
+	for _, event := range events {
+		require.NotEqual(t, "response.output_text.delta", event.Type)
+	}
+	events = append(events, FinalizeChatCompletionsResponsesStream(state)...)
+
+	var textDeltas []string
+	for _, event := range events {
+		if event.Type == "response.output_text.delta" {
+			textDeltas = append(textDeltas, event.Delta)
+		}
+	}
+	require.Equal(t, []string{"final answer"}, textDeltas)
+}
+
+func TestNonStream_AgentHarnessSuppressesNarrationOnToolTurn(t *testing.T) {
+	content, _ := json.Marshal("I need the intermediate result first.")
+	response := &ChatCompletionsResponse{
+		Choices: []ChatChoice{{Message: ChatMessage{
+			Role:    "assistant",
+			Content: content,
+			ToolCalls: []ChatToolCall{{
+				ID:   "call_a",
+				Type: "function",
+				Function: ChatFunctionCall{
+					Name:      "exec",
+					Arguments: `{}`,
+				},
+			}},
+		}}},
+	}
+	converted := ChatCompletionsResponseToResponsesWithOptions(
+		response, "deepseek-v4-flash", nil, map[string]bool{"exec": true}, false, nil,
+		&ChatCompletionsToResponsesOptions{SuppressTextWithToolCalls: true},
+	)
+	require.Len(t, converted.Output, 1)
+	require.Equal(t, "function_call", converted.Output[0].Type)
 }
 
 // TestStream_ToolCallLifecycleComplete guards that a tool call is fully closed

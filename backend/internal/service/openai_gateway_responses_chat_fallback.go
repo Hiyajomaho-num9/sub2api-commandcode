@@ -57,6 +57,15 @@ func (s *OpenAIGatewayService) forwardResponsesViaRawChatCompletions(
 	upstreamModel := normalizeOpenAIModelForUpstream(account, billingModel)
 	deepSeekFallback := isDeepSeekRawChatCompletionsRequest(account, originalModel, billingModel, upstreamModel)
 	agentHarnessCandidate := deepSeekFallback && len(effectiveTools) > 0
+	prefixMessages, err := s.loadResponsesChatFallbackPrefix(ctx, account.ID, responsesReq.PreviousResponseID)
+	if err != nil {
+		statusCode := http.StatusServiceUnavailable
+		if errors.Is(err, errResponsesChatFallbackStateNotFound) {
+			statusCode = http.StatusBadRequest
+		}
+		writeOpenAIResponsesFallbackError(c, statusCode, "invalid_request_error", err.Error())
+		return nil, fmt.Errorf("restore previous responses fallback state: %w", err)
+	}
 	if !agentHarnessCandidate {
 		// Keep the legacy self-heal ordering: plaintext reasoning in this request
 		// is available to encrypted-only replicas during the same conversion.
@@ -66,6 +75,7 @@ func (s *OpenAIGatewayService) forwardResponsesViaRawChatCompletions(
 	chatReq, err := apicompat.ResponsesToChatCompletionsRequestWithOptions(&responsesReq, &apicompat.ResponsesToChatOptions{
 		ReasoningContentByID:       s.reasoningContentByID,
 		PreferReasoningContentByID: agentHarnessCandidate,
+		PrefixMessages:             prefixMessages,
 	})
 	if err != nil {
 		writeOpenAIResponsesFallbackError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
@@ -144,9 +154,9 @@ func (s *OpenAIGatewayService) forwardResponsesViaRawChatCompletions(
 	}
 
 	if clientStream {
-		return s.streamChatCompletionsAsResponses(c, resp, originalModel, customTools, functionTools, toolSearch, namespaceTools, billingModel, upstreamModel, reasoningEffort, serviceTier, agentHarnessMode, startTime)
+		return s.streamChatCompletionsAsResponses(c, resp, account.ID, chatReq.Messages, originalModel, customTools, functionTools, toolSearch, namespaceTools, billingModel, upstreamModel, reasoningEffort, serviceTier, agentHarnessMode, startTime)
 	}
-	return s.bufferChatCompletionsAsResponses(c, resp, originalModel, customTools, functionTools, toolSearch, namespaceTools, billingModel, upstreamModel, reasoningEffort, serviceTier, agentHarnessMode, startTime)
+	return s.bufferChatCompletionsAsResponses(c, resp, account.ID, chatReq.Messages, originalModel, customTools, functionTools, toolSearch, namespaceTools, billingModel, upstreamModel, reasoningEffort, serviceTier, agentHarnessMode, startTime)
 }
 
 const deepSeekAgentHarnessInstructions = `You are running inside an external agent harness. Treat this request as exactly one turn of a tool-execution loop.
@@ -179,9 +189,103 @@ func applyDeepSeekAgentHarnessInstructions(req *apicompat.ChatCompletionsRequest
 	req.Messages = append([]apicompat.ChatMessage{{Role: "system", Content: content}}, req.Messages...)
 }
 
+var errResponsesChatFallbackStateNotFound = errors.New("previous_response_id state is unavailable; resend the full Responses history")
+
+const responsesChatFallbackStateTTL = 7 * 24 * time.Hour
+
+type responsesChatFallbackStateCache interface {
+	SetResponsesChatFallbackState(ctx context.Context, accountID int64, responseID string, payload []byte, ttl time.Duration) error
+	GetResponsesChatFallbackState(ctx context.Context, accountID int64, responseID string) ([]byte, error)
+}
+
+type responsesChatFallbackState struct {
+	Model    string                  `json:"model,omitempty"`
+	Messages []apicompat.ChatMessage `json:"messages"`
+}
+
+func (s *OpenAIGatewayService) loadResponsesChatFallbackPrefix(ctx context.Context, accountID int64, previousResponseID string) ([]apicompat.ChatMessage, error) {
+	previousResponseID = strings.TrimSpace(previousResponseID)
+	if previousResponseID == "" {
+		return nil, nil
+	}
+	cache, ok := s.cache.(responsesChatFallbackStateCache)
+	if !ok {
+		return nil, errResponsesChatFallbackStateNotFound
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	payload, err := cache.GetResponsesChatFallbackState(lookupCtx, accountID, previousResponseID)
+	if err != nil {
+		return nil, fmt.Errorf("load previous_response_id state: %w", err)
+	}
+	if len(payload) == 0 {
+		return nil, errResponsesChatFallbackStateNotFound
+	}
+	var state responsesChatFallbackState
+	if err := json.Unmarshal(payload, &state); err != nil {
+		return nil, fmt.Errorf("decode previous_response_id state: %w", err)
+	}
+	return state.Messages, nil
+}
+
+func (s *OpenAIGatewayService) cacheResponsesChatFallbackState(
+	accountID int64,
+	responseID string,
+	model string,
+	requestMessages []apicompat.ChatMessage,
+	responseMessage apicompat.ChatMessage,
+) {
+	cache, ok := s.cache.(responsesChatFallbackStateCache)
+	if !ok || strings.TrimSpace(responseID) == "" {
+		return
+	}
+	messages := make([]apicompat.ChatMessage, 0, len(requestMessages)+1)
+	for _, message := range requestMessages {
+		if message.Role != "system" {
+			messages = append(messages, message)
+		}
+	}
+	if responseMessage.Role == "" {
+		responseMessage.Role = "assistant"
+	}
+	messages = append(messages, responseMessage)
+	payload, err := json.Marshal(responsesChatFallbackState{Model: model, Messages: messages})
+	if err != nil {
+		logger.L().Warn("openai responses chat fallback: marshal response state failed",
+			zap.Error(err),
+			zap.String("response_id", responseID),
+		)
+		return
+	}
+	storeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := cache.SetResponsesChatFallbackState(storeCtx, accountID, responseID, payload, responsesChatFallbackStateTTL); err != nil {
+		logger.L().Warn("openai responses chat fallback: cache response state failed",
+			zap.Error(err),
+			zap.String("response_id", responseID),
+		)
+	}
+}
+
+func chatCompletionsResponseMessageForHistory(resp *apicompat.ChatCompletionsResponse, suppressTextWithToolCalls bool) (apicompat.ChatMessage, bool) {
+	if resp == nil || len(resp.Choices) == 0 {
+		return apicompat.ChatMessage{}, false
+	}
+	message := resp.Choices[0].Message
+	if message.Role == "" {
+		message.Role = "assistant"
+	}
+	if suppressTextWithToolCalls && len(message.ToolCalls) > 0 {
+		message.Content = nil
+	}
+	return message, true
+}
+
 func (s *OpenAIGatewayService) bufferChatCompletionsAsResponses(
 	c *gin.Context,
 	resp *http.Response,
+	accountID int64,
+	requestMessages []apicompat.ChatMessage,
 	originalModel string,
 	customTools map[string]bool,
 	functionTools map[string]bool,
@@ -201,13 +305,19 @@ func (s *OpenAIGatewayService) bufferChatCompletionsAsResponses(
 	}
 	var responseOptions *apicompat.ChatCompletionsToResponsesOptions
 	if agentHarnessMode {
-		responseOptions = &apicompat.ChatCompletionsToResponsesOptions{CompactReasoningSummary: true}
+		responseOptions = &apicompat.ChatCompletionsToResponsesOptions{
+			CompactReasoningSummary:   true,
+			SuppressTextWithToolCalls: true,
+		}
 	}
 	responsesResp := apicompat.ChatCompletionsResponseToResponsesWithOptions(ccResp, originalModel, customTools, functionTools, toolSearch, namespaceTools, responseOptions)
 	if agentHarnessMode {
 		s.cacheRawReasoningForOutput(responsesResp.Output, chatCompletionsResponseReasoning(ccResp))
 	} else {
 		s.cacheReasoningItemsFromOutput(responsesResp.Output)
+	}
+	if message, ok := chatCompletionsResponseMessageForHistory(ccResp, agentHarnessMode); ok {
+		s.cacheResponsesChatFallbackState(accountID, responsesResp.ID, originalModel, requestMessages, message)
 	}
 
 	if s.responseHeaderFilter != nil {
@@ -231,6 +341,8 @@ func (s *OpenAIGatewayService) bufferChatCompletionsAsResponses(
 func (s *OpenAIGatewayService) streamChatCompletionsAsResponses(
 	c *gin.Context,
 	resp *http.Response,
+	accountID int64,
+	requestMessages []apicompat.ChatMessage,
 	originalModel string,
 	customTools map[string]bool,
 	functionTools map[string]bool,
@@ -248,6 +360,7 @@ func (s *OpenAIGatewayService) streamChatCompletionsAsResponses(
 
 	state := apicompat.NewChatCompletionsToResponsesStreamState(originalModel)
 	state.CompactReasoningSummary = agentHarnessMode
+	state.SuppressTextWithToolCalls = agentHarnessMode
 	state.CustomTools = customTools
 	state.FunctionTools = functionTools
 	state.ToolSearchDeclared = toolSearch
@@ -325,6 +438,7 @@ func (s *OpenAIGatewayService) streamChatCompletionsAsResponses(
 	} else {
 		s.cacheReasoningItemsFromEvents(finalEvents)
 	}
+	s.cacheResponsesChatFallbackState(accountID, state.ResponseID, originalModel, requestMessages, state.ChatMessage())
 	writeEvents(finalEvents)
 	if !clientDisconnected {
 		writeStreamHeaders()
